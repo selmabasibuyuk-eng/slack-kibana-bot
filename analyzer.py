@@ -1,52 +1,100 @@
 import requests
-from config import SLACK_WEBHOOK_URL, ERROR_THRESHOLD
+from config import SLACK_WEBHOOK_URL, THRESHOLDS
 
-def send_slack_alert(message: str):
-    if not SLACK_WEBHOOK_URL:
-        print("[MOCK SLACK ALERT]:", message)
-        return
+class TrafficAnalyzer:
+    def __init__(self, current_data, previous_data, prebook_error_data):
+        self.current_data = current_data
+        self.previous_data = previous_data
+        self.prebook_error_data = prebook_error_data
 
-    payload = {"text": message}
-    requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
+    def send_slack_alert(self, text):
+        if SLACK_WEBHOOK_URL:
+            requests.post(SLACK_WEBHOOK_URL, json={"text": text})
+        else:
+            print(f"[SLACK ALERT]\n{text}\n")
 
-def analyze_and_report(kibana_client):
-    print("1. Aşama: Search sayıları ve HTTP statüleri analiz ediliyor...")
-    data_stage1 = kibana_client.fetch_search_and_status_counts()
-    
-    total_searches = 0
-    total_errors = 0
-    
-    buckets = data_stage1.get("aggregations", {}).get("by_endpoint", {}).get("buckets", [])
-    for bucket in buckets:
-        total_searches += bucket.get("doc_count", 0)
-        status_buckets = bucket.get("by_http_status", {}).get("buckets", [])
-        for st in status_buckets:
-            if str(st.get("key")).startswith(("4", "5")):
-                total_errors += st.get("doc_count", 0)
-
-    error_rate = (total_errors / total_searches * 100) if total_searches > 0 else 0.0
-    print(f"Toplam Arama: {total_searches}, Toplam Hata: {total_errors}, Hata Oranı: %{error_rate:.2f}")
-
-    if error_rate >= ERROR_THRESHOLD:
-        print(f"Eşik değer (%{ERROR_THRESHOLD}) aşıldı! 2. Aşamaya geçiliyor...")
+    def analyze(self):
+        endpoints = self.current_data.get("aggregations", {}).get("by_endpoint", {}).get("buckets", [])
         
-        data_stage2 = kibana_client.fetch_prebook_errors()
-        error_buckets = data_stage2.get("aggregations", {}).get("by_error", {}).get("buckets", [])
-        
-        top_errors = []
-        for err in error_buckets[:3]:
-            top_errors.append(f"- *{err.get('key')}*: {err.get('doc_count')} adet")
-            
-        error_detail_str = "\n".join(top_errors) if top_errors else "Detaylı hata kaydı bulunamadı."
-        
-        alert_msg = (
-            f"🚨 *KIBANA KRİTİK HATA UYARISI*\n"
-            f"• *Hata Oranı:* %{error_rate:.2f}\n"
-            f"• *Toplam Arama:* {total_searches}\n"
-            f"• *Hata Sayısı:* {total_errors}\n\n"
-            f"🔍 *En Çok Alınan Prebook Hataları (Son 14 Gün):*\n{error_detail_str}"
-        )
-        
-        send_slack_alert(alert_msg)
-    else:
-        print("Sistem sağlıklı, threshold aşılmadı.")
+        for ep in endpoints:
+            endpoint_name = ep["key"]
+            for contract in ep.get("by_contract", {}).get("buckets", []):
+                slug = contract["key"]
+                total_requests = contract["doc_count"]
+                if total_requests == 0:
+                    continue
+
+                status_counts = {str(b["key"]): b["doc_count"] for b in contract.get("by_status", {}).get("buckets", [])}
+                
+                count_400 = status_counts.get("400", 0)
+                count_429 = status_counts.get("429", 0)
+                pct_400 = (count_400 / total_requests) * 100
+                pct_429 = (count_429 / total_requests) * 100
+
+                if pct_400 > THRESHOLDS["HTTP_400_MAX_PERCENT"]:
+                    self.send_slack_alert(f"⚠️ *High 400 Errors Detected*\n• *Partner:* `{slug}`\n• *Endpoint:* `{endpoint_name}`\n• *Ratio:* %{pct_400:.1f} ({count_400}/{total_requests})")
+
+                if pct_429 > THRESHOLDS["HTTP_429_MAX_PERCENT"]:
+                    self.send_slack_alert(f"⚠️ *High 429 Rate Limits Detected*\n• *Partner:* `{slug}`\n• *Endpoint:* `{endpoint_name}`\n• *Ratio:* %{pct_429:.1f} ({count_429}/{total_requests})")
+
+                if endpoint_name == "prebook":
+                    non_200_count = total_requests - status_counts.get("200", 0)
+                    pct_error = (non_200_count / total_requests) * 100
+                    
+                    if pct_error > THRESHOLDS["PREBOOK_ERROR_MAX_PERCENT"]:
+                        error_details = self._get_prebook_error_breakdown(slug)
+                        self.send_slack_alert(
+                            f"🚨 *Prebook Error Threshold Exceeded*\n"
+                            f"• *Partner:* `{slug}`\n"
+                            f"• *Total Error Ratio:* %{pct_error:.1f}\n"
+                            f"• *Error Breakdown:*\n{error_details}"
+                        )
+
+        self._analyze_search_growth()
+
+    def _get_prebook_error_breakdown(self, target_slug):
+        contracts = self.prebook_error_data.get("aggregations", {}).get("by_contract", {}).get("buckets", [])
+        for c in contracts:
+            if c["key"] == target_slug:
+                total = c["doc_count"]
+                if total == 0:
+                    return "No detail available."
+                errors = c.get("by_error", {}).get("buckets", [])
+                breakdown = []
+                for err in errors:
+                    pct = (err['doc_count'] / total) * 100
+                    breakdown.append(f"  - `{err['key']}`: %{pct:.1f} ({err['doc_count']})")
+                return "\n".join(breakdown)
+        return "No error breakdown data."
+
+    def _analyze_search_growth(self):
+        curr_searches = self._extract_search_counts(self.current_data)
+        prev_searches = self._extract_search_counts(self.previous_data)
+
+        for slug, curr_count in curr_searches.items():
+            prev_count = prev_searches.get(slug, 0)
+            if prev_count > 0:
+                growth = ((curr_count - prev_count) / prev_count) * 100
+                if growth >= THRESHOLDS["SEARCH_GROWTH_PERCENT"]:
+                    self.send_slack_alert(
+                        f"📈 *Search Volume Increase Detected*\n"
+                        f"• *Partner:* `{slug}`\n"
+                        f"• *Previous 3 Days:* {prev_count}\n"
+                        f"• *Current 3 Days:* {curr_count}\n"
+                        f"• *Growth:* +%{growth:.1f}"
+                    )
+            elif curr_count > 100:
+                self.send_slack_alert(
+                    f"📈 *New Search Volume Detected*\n"
+                    f"• *Partner:* `{slug}`\n"
+                    f"• *Current 3 Days:* {curr_count}"
+                )
+
+    def _extract_search_counts(self, raw_data):
+        counts = {}
+        endpoints = raw_data.get("aggregations", {}).get("by_endpoint", {}).get("buckets", [])
+        for ep in endpoints:
+            if ep["key"] == "search":
+                for contract in ep.get("by_contract", {}).get("buckets", []):
+                    counts[contract["key"]] = contract["doc_count"]
+        return counts
